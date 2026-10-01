@@ -23,48 +23,68 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.fruit_top_by_client = {}
+        self.sum_eof_received = {}
 
-    def _process_data(self, fruit, amount):
+    def _process_data(self, uuid, fruit, amount):
         logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+        client_fruit_top = self.fruit_top_by_client.get(uuid, {})
+        client_fruit_top[fruit] = client_fruit_top.get(fruit, 0) + amount
+        self.fruit_top_by_client[uuid] = client_fruit_top
 
-    def _process_eof(self):
+    def _process_eof(self, uuid):
         logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
-        )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        if uuid not in self.fruit_top_by_client:
+            logging.warning(f"Received EOF for unknown uuid: {uuid}")
+            self.output_queue.send(message_protocol.internal.serialize_top_message([uuid, []]))
+            return
+        self.sum_eof_received[uuid] = self.sum_eof_received.get(uuid, 0) + 1
+        if self.sum_eof_received[uuid] < SUM_AMOUNT:
+            logging.info(f"Waiting for more EOFs for uuid: {uuid}. Received {self.sum_eof_received[uuid]} out of {SUM_AMOUNT}")
+            return
+
+        client_fruit = self.fruit_top_by_client.get(uuid, {})
+        fruit_items = [fruit_item.FruitItem(item[0], item[1]) for item in client_fruit.items()]
+        fruit_items.sort(reverse=True)
+        top = fruit_items[:TOP_SIZE]
+        self.output_queue.send(message_protocol.internal.serialize_top_message([uuid, [(item.fruit, item.amount) for item in top]]))
+        del self.fruit_top_by_client[uuid]
+        del self.sum_eof_received[uuid]
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
+        try:
+            fields = message_protocol.internal.deserialize(message)
+        except Exception as e:
+            logging.error(f"Error deserializing message: {e}")
+            nack()
+            return
+        if len(fields) >= 2:
             self._process_data(*fields)
         else:
-            self._process_eof()
+            self._process_eof(*fields)
         ack()
 
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
 
+    def stop(self):
+        self.input_exchange.stop_consuming()
+        self.input_exchange.close()
+        self.output_queue.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
+    try:
+        aggregation_filter.start()
+    except KeyboardInterrupt:
+        logging.info("Aggregation filter stopped by user")
+        aggregation_filter.stop()
+    except Exception as e:
+        logging.error(f"Error starting aggregation filter: {e}")
+        aggregation_filter.stop()
     return 0
 
 

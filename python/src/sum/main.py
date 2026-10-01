@@ -24,44 +24,108 @@ class SumFilter:
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
 
-    def _process_data(self, fruit, amount):
+        self.control_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT) if i != ID],
+        )
+        self.threads = []
+        self.amount_by_client = {}
+
+    def _process_data(self, uuid, fruit, amount):
         logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
+        self.amount_by_client[uuid] = self.amount_by_client.get(uuid, {})
+        self.amount_by_client[uuid][fruit] = self.amount_by_client[uuid].get(
             fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+        ) + fruit_item.FruitItem(fruit, amount)
 
-    def _process_eof(self):
+    def _process_eof(self, uuid):
+
         logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
+
+        for final_fruit_item in self.amount_by_client[uuid].values():
+            exchange_index = (
+                hash(f"{uuid}{final_fruit_item.fruit}") % AGGREGATION_AMOUNT
+            )
+            self.data_output_exchanges[exchange_index].send(
+                message_protocol.internal.serialize(
+                    [uuid, final_fruit_item.fruit, final_fruit_item.amount]
                 )
+            )
 
-        logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+        self.data_output_exchanges[exchange_index].send(
+            message_protocol.internal.serialize([uuid])
+        )
+        if uuid in self.amount_by_client:
+            self.control_output_exchange.send(
+                message_protocol.internal.serialize([uuid])
+            )
+            del self.amount_by_client[uuid]
 
+    def process_control_messsage(self, message, ack, nack):
+        logging.info("Process control message")
+        try:
+          fields = message_protocol.internal.deserialize(message)
+        except Exception as e:
+            logging.error(f"Error deserializing control message: {e}")
+            nack()
+            return
 
-    def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
+        if len(fields) == 1:
             self._process_eof(*fields)
         ack()
 
+    def process_data_messsage(self, message, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(message)
+        except Exception as e:
+            logging.error(f"Error deserializing data message: {e}")
+            nack()
+            return
+        if len(fields) == 3:
+            self._process_data(*fields)
+        elif len(fields) == 1:
+            self._process_eof(*fields)
+        else:
+            logging.error(f"Unexpected number of fields in data message: {len(fields)}")
+            nack()
+            return
+        ack()
+
     def start(self):
+        thread = threading.Thread(
+            target=self.control_output_exchange.start_consuming, args=(self.process_control_messsage,)
+        )
+        thread.start()
+        self.threads.append(thread)
         self.input_queue.start_consuming(self.process_data_messsage)
+
+    def stop(self):
+        self.input_queue.stop_consuming()
+        self.input_queue.close()
+        for data_output_exchange in self.data_output_exchanges:
+            data_output_exchange.stop_consuming()
+            data_output_exchange.close()
+
+        for t in self.threads:
+            t.join()
+
+        self.control_output_exchange.stop_consuming()
+        self.control_output_exchange.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
+    try:
+        sum_filter.start()
+    except KeyboardInterrupt:
+        logging.info("Sum filter stopped by user")
+        sum_filter.stop()
+    except Exception as e:
+        logging.error(f"Error starting sum filter: {e}")
+        sum_filter.stop()
     return 0
 
 
