@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -25,6 +26,7 @@ class JoinFilter:
 
         self.top_by_client = {}
         self.aggregation_eof_received = {}
+        self.shutdown = False
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
@@ -42,8 +44,8 @@ class JoinFilter:
         self.aggregation_eof_received[uuid] = self.aggregation_eof_received.get(uuid, 0) + 1
         if self.aggregation_eof_received[uuid] == AGGREGATION_AMOUNT:
             logging.info(f"Received all EOFs for uuid: {uuid}, sending to output queue")
-            top_list = [(fruit, amount) for fruit, amount in self.top_by_client[uuid].items()]
-            top_list.sort(key=lambda x: x[1], reverse=True)
+            top_list = [fruit_item.FruitItem(fruit, amount) for fruit, amount in self.top_by_client[uuid].items()]
+            top_list.sort(reverse=True)
             self.output_queue.send(message_protocol.internal.serialize_top_message([uuid, top_list[:TOP_SIZE]]))
             del self.top_by_client[uuid]
             del self.aggregation_eof_received[uuid]
@@ -53,20 +55,28 @@ class JoinFilter:
         self.input_queue.start_consuming(self.process_messsage)
 
     def stop(self):
+        if self.shutdown:
+            return
+        self.shutdown = True
         self.input_queue.stop_consuming()
         self.input_queue.close()
         self.output_queue.close()
 
+    def handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.input_queue.stop_consuming()
+
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
+    signal.signal(signal.SIGTERM, join_filter.handle_sigterm)
     try:
         join_filter.start()
     except KeyboardInterrupt:
         logging.info("Join filter stopped by user")
-        join_filter.stop()
     except Exception as e:
         logging.error(f"Error occurred while starting join filter: {e}")
+    finally:
         join_filter.stop()
 
     return 0

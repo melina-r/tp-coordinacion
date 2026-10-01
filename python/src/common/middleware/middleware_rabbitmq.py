@@ -1,3 +1,5 @@
+import threading
+
 import pika
 
 from .middleware import (
@@ -13,6 +15,7 @@ class _MessageMiddlewareRabbitMQBase:
     def __init__(self, host):
         self.host = host
         self.queue_name = None
+        self.consumer_thread_id = None
         try:
             self.connection = pika.BlockingConnection(
                 pika.ConnectionParameters(host=host)
@@ -24,6 +27,8 @@ class _MessageMiddlewareRabbitMQBase:
             raise MessageMiddlewareMessageError() from e
 
     def start_consuming(self, on_message_callback):
+        self.consumer_thread_id = threading.get_ident()
+
         def callback(channel, method, properties, body):
             ack = lambda: channel.basic_ack(delivery_tag=method.delivery_tag)
             nack = lambda: channel.basic_nack(delivery_tag=method.delivery_tag)
@@ -42,7 +47,19 @@ class _MessageMiddlewareRabbitMQBase:
 
     def stop_consuming(self):
         try:
-            self.channel.stop_consuming()
+            if not self.connection or not self.connection.is_open:
+                return
+            if self.consumer_thread_id == threading.get_ident():
+                self.channel.stop_consuming()
+            else:
+                try:
+                    self.connection.add_callback_threadsafe(
+                        self.channel.stop_consuming
+                    )
+                except pika.exceptions.ConnectionWrongStateError:
+                    return
+        except OSError:
+            return
         except pika.exceptions.AMQPConnectionError:
             raise MessageMiddlewareDisconnectedError()
         except Exception as e:
@@ -52,6 +69,8 @@ class _MessageMiddlewareRabbitMQBase:
         try:
             if self.connection and self.connection.is_open:
                 self.connection.close()
+        except (OSError, pika.exceptions.ConnectionWrongStateError):
+            return
         except pika.exceptions.AMQPConnectionError:
             raise MessageMiddlewareDisconnectedError()
         except Exception as e:

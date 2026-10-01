@@ -1,6 +1,7 @@
 import os
 import logging
 import bisect
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -25,6 +26,7 @@ class AggregationFilter:
         )
         self.fruit_top_by_client = {}
         self.sum_eof_received = {}
+        self.shutdown = False
 
     def _process_data(self, uuid, fruit, amount):
         logging.info("Processing data message")
@@ -43,7 +45,9 @@ class AggregationFilter:
         fruit_items = [fruit_item.FruitItem(item[0], item[1]) for item in client_fruit_top.items()]
         fruit_items.sort(reverse=True)
         top = fruit_items[:TOP_SIZE]
-        self.output_queue.send(message_protocol.internal.serialize_top_message([uuid, [(item.fruit, item.amount) for item in top]]))
+        self.output_queue.send(
+            message_protocol.internal.serialize_top_message([uuid, top])
+        )
         del self.fruit_top_by_client[uuid]
         del self.sum_eof_received[uuid]
 
@@ -65,21 +69,29 @@ class AggregationFilter:
         self.input_exchange.start_consuming(self.process_messsage)
 
     def stop(self):
+        if self.shutdown:
+            return
+        self.shutdown = True
         self.input_exchange.stop_consuming()
         self.input_exchange.close()
         self.output_queue.close()
+
+    def handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.input_exchange.stop_consuming()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
+    signal.signal(signal.SIGTERM, aggregation_filter.handle_sigterm)
     try:
         aggregation_filter.start()
     except KeyboardInterrupt:
         logging.info("Aggregation filter stopped by user")
-        aggregation_filter.stop()
     except Exception as e:
         logging.error(f"Error starting aggregation filter: {e}")
+    finally:
         aggregation_filter.stop()
     return 0
 
