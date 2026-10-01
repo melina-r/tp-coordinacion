@@ -35,8 +35,8 @@ class JoinFilter:
             nack()
             return
 
+        self.top_by_client.setdefault(uuid, {})
         for fruit, amount in fruit_top:
-            self.top_by_client[uuid] = self.top_by_client.get(uuid, {})
             self.top_by_client[uuid][fruit] = self.top_by_client[uuid].get(fruit, 0) + amount
 
         self.aggregation_eof_received[uuid] = self.aggregation_eof_received.get(uuid, 0) + 1

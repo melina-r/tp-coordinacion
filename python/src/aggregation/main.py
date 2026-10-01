@@ -33,18 +33,14 @@ class AggregationFilter:
         self.fruit_top_by_client[uuid] = client_fruit_top
 
     def _process_eof(self, uuid):
-        logging.info("Received EOF")
-        if uuid not in self.fruit_top_by_client:
-            logging.warning(f"Received EOF for unknown uuid: {uuid}")
-            self.output_queue.send(message_protocol.internal.serialize_top_message([uuid, []]))
-            return
+        logging.info(f"Received EOF for uuid: {uuid}")
+        client_fruit_top = self.fruit_top_by_client.setdefault(uuid, {})
         self.sum_eof_received[uuid] = self.sum_eof_received.get(uuid, 0) + 1
         if self.sum_eof_received[uuid] < SUM_AMOUNT:
             logging.info(f"Waiting for more EOFs for uuid: {uuid}. Received {self.sum_eof_received[uuid]} out of {SUM_AMOUNT}")
             return
 
-        client_fruit = self.fruit_top_by_client.get(uuid, {})
-        fruit_items = [fruit_item.FruitItem(item[0], item[1]) for item in client_fruit.items()]
+        fruit_items = [fruit_item.FruitItem(item[0], item[1]) for item in client_fruit_top.items()]
         fruit_items.sort(reverse=True)
         top = fruit_items[:TOP_SIZE]
         self.output_queue.send(message_protocol.internal.serialize_top_message([uuid, [(item.fruit, item.amount) for item in top]]))

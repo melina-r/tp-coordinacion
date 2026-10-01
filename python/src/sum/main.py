@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+from hashlib import sha256
 
 from common import middleware, message_protocol, fruit_item
 
@@ -28,40 +29,56 @@ class SumFilter:
         self.control_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST,
             SUM_CONTROL_EXCHANGE,
-            [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT) if i != ID],
+            [f"{SUM_CONTROL_EXCHANGE}_{(ID + 1) % SUM_AMOUNT}"],
+        )
+        self.control_input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            [f"{SUM_CONTROL_EXCHANGE}_{ID}"],
         )
         self.threads = []
         self.amount_by_client = {}
+        self.completed_clients = set()
+        self.data_output_lock = threading.Lock()
 
     def _process_data(self, uuid, fruit, amount):
         logging.info(f"Process data")
-        self.amount_by_client[uuid] = self.amount_by_client.get(uuid, {})
-        self.amount_by_client[uuid][fruit] = self.amount_by_client[uuid].get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, amount)
+        with self.data_output_lock:
+            self.amount_by_client[uuid] = self.amount_by_client.get(uuid, {})
+            self.amount_by_client[uuid][fruit] = self.amount_by_client[uuid].get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, amount)
 
-    def _process_eof(self, uuid):
+    def _process_eof(self, uuid, propagate=True):
 
         logging.info(f"Broadcasting data messages")
 
-        for final_fruit_item in self.amount_by_client[uuid].values():
-            exchange_index = (
-                hash(f"{uuid}{final_fruit_item.fruit}") % AGGREGATION_AMOUNT
-            )
-            self.data_output_exchanges[exchange_index].send(
-                message_protocol.internal.serialize(
-                    [uuid, final_fruit_item.fruit, final_fruit_item.amount]
-                )
-            )
+        with self.data_output_lock:
+            if uuid in self.completed_clients:
+                return
 
-        self.data_output_exchanges[exchange_index].send(
-            message_protocol.internal.serialize([uuid])
-        )
-        if uuid in self.amount_by_client:
-            self.control_output_exchange.send(
-                message_protocol.internal.serialize([uuid])
-            )
-            del self.amount_by_client[uuid]
+            self.completed_clients.add(uuid)
+            for final_fruit_item in self.amount_by_client.get(uuid, {}).values():
+                routing_key = f"{uuid}{final_fruit_item.fruit}".encode("utf-8")
+                exchange_index = int.from_bytes(
+                    sha256(routing_key).digest(), "big"
+                ) % AGGREGATION_AMOUNT
+                self.data_output_exchanges[exchange_index].send(
+                    message_protocol.internal.serialize(
+                        [uuid, final_fruit_item.fruit, final_fruit_item.amount]
+                    )
+                )
+
+            for data_output_exchange in self.data_output_exchanges:
+                data_output_exchange.send(message_protocol.internal.serialize([uuid]))
+
+            if propagate:
+                self.control_output_exchange.send(
+                    message_protocol.internal.serialize([uuid])
+                )
+
+            if uuid in self.amount_by_client:
+                del self.amount_by_client[uuid]
 
     def process_control_messsage(self, message, ack, nack):
         logging.info("Process control message")
@@ -95,7 +112,8 @@ class SumFilter:
 
     def start(self):
         thread = threading.Thread(
-            target=self.control_output_exchange.start_consuming, args=(self.process_control_messsage,)
+            target=self.control_input_exchange.start_consuming,
+            args=(self.process_control_messsage,),
         )
         thread.start()
         self.threads.append(thread)
@@ -104,15 +122,15 @@ class SumFilter:
     def stop(self):
         self.input_queue.stop_consuming()
         self.input_queue.close()
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.stop_consuming()
-            data_output_exchange.close()
+        self.control_input_exchange.stop_consuming()
 
         for t in self.threads:
             t.join()
 
-        self.control_output_exchange.stop_consuming()
+        self.control_input_exchange.close()
         self.control_output_exchange.close()
+        for data_output_exchange in self.data_output_exchanges:
+            data_output_exchange.close()
 
 
 def main():

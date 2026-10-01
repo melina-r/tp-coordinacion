@@ -100,7 +100,8 @@ def deserialize(message):
     if offset >= len(data):
         return [uuid]
 
-    fruit_name, offset = deserialize_fruit_name(data[offset:])
+    fruit_name, fruit_offset = deserialize_fruit_name(data[offset:])
+    offset += fruit_offset
     fruit_amount, _ = deserialize_fruit_amount(data[offset:])
     return uuid, fruit_name, fruit_amount
 
@@ -108,7 +109,9 @@ def deserialize_top_message(message):
     uuid, offset = deserialize_uuid(message)
     top_list = []
     while offset < len(message):
-        fruit_name, offset = deserialize_fruit_name(message[offset:])
-        fruit_amount, offset = deserialize_fruit_amount(message[offset:])
+        fruit_name, fruit_offset = deserialize_fruit_name(message[offset:])
+        offset += fruit_offset
+        fruit_amount, amount_offset = deserialize_fruit_amount(message[offset:])
+        offset += amount_offset
         top_list.append((fruit_name, fruit_amount))
     return uuid, top_list
